@@ -47,6 +47,7 @@ typedef enum
 /* USER CODE BEGIN PD */
 #define RXBUFFERSIZE 256
 #define SERVO_0_DEG_PULSE 1000U
+#define SERVO_90_DEG_PULSE 1620U
 #define SERVO_180_DEG_PULSE 2000U
 #define BUZZER_LOW_PULSE 10U
 #define BUZZER_MEDIUM_PULSE 20U
@@ -78,6 +79,7 @@ static volatile uint8_t servo_command;
 static volatile uint8_t flag_uart2_buzzer;
 static volatile uint8_t flag_openmv_start;
 static uint8_t buzzer_on;
+static uint8_t servo_toggle_to_180;
 static PowerButtonState power_button_state;
 static uint32_t power_button_tick;
 static uint32_t power_beep_tick;
@@ -459,13 +461,22 @@ int main(void)
 
       if (command == 2U)
       {
-        SetServosPulse(SERVO_0_DEG_PULSE);
+        if (servo_toggle_to_180 == 0U)
+        {
+          SetServosPulse(SERVO_0_DEG_PULSE);
+          servo_toggle_to_180 = 1U;
+        }
+        else
+        {
+          SetServosPulse(SERVO_180_DEG_PULSE);
+          servo_toggle_to_180 = 0U;
+        }
         (void)QueueUartData(uart_reply, sizeof(uart_reply) - 1U);
-
       }
       else if (command == 3U)
       {
-        SetServosPulse(SERVO_180_DEG_PULSE);
+        SetServosPulse(SERVO_90_DEG_PULSE);
+        servo_toggle_to_180 = 1U;
         (void)QueueUartData(uart_reply, sizeof(uart_reply) - 1U);
       }
     }
