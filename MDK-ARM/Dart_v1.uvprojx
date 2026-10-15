@@ -392,11 +392,6 @@
           <GroupName>Application/User/Core</GroupName>
           <Files>
             <File>
-              <FileName>main.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>../Core/Src/main.c</FilePath>
-            </File>
-            <File>
               <FileName>bmi088.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/bmi088.c</FilePath>
@@ -410,6 +405,16 @@
               <FileName>attitude.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/attitude.c</FilePath>
+            </File>
+            <File>
+              <FileName>openmv_task.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/openmv_task.c</FilePath>
+            </File>
+            <File>
+              <FileName>main.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/main.c</FilePath>
             </File>
             <File>
               <FileName>gpio.c</FileName>

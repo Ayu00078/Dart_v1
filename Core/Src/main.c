@@ -26,6 +26,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "imu_task.h"
+#include "openmv_task.h"
 #include <stdio.h>
 #include <string.h>
 /* USER CODE END Includes */
@@ -58,6 +59,7 @@ typedef enum
 #define EFFECT_LENGTH_MS ((2U * EFFECT_BEEP_INTERVAL_MS) + EFFECT_BEEP_LENGTH_MS)
 #define UART_TX_BUFFER_SIZE 128U
 #define IMU_DEBUG_PERIOD_MS 200U
+#define IMU_ENABLE 0U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -74,6 +76,7 @@ static uint8_t Uart2_Rx_Cnt;
 static volatile uint8_t flag_uart2;
 static volatile uint8_t servo_command;
 static volatile uint8_t flag_uart2_buzzer;
+static volatile uint8_t flag_openmv_start;
 static uint8_t buzzer_on;
 static PowerButtonState power_button_state;
 static uint32_t power_button_tick;
@@ -85,6 +88,9 @@ static volatile uint8_t uart_tx_busy;
 static volatile uint8_t uart_overflow_pending;
 static uint32_t uart_tx_drop_count;
 static uint32_t imu_debug_tick;
+static uint32_t openmv_reported_target_count;
+static OpenMV_State openmv_reported_state;
+static OpenMV_Error openmv_reported_error;
 static const uint8_t uart_reply[] = "ok\r\n";
 /* USER CODE END PV */
 
@@ -97,6 +103,7 @@ static void UpdateBuzzer(uint32_t now);
 static void HandlePowerButton(void);
 static uint8_t QueueUartData(const uint8_t *data, uint16_t length);
 static void IMUDebugOutputTask(uint32_t now);
+static void OpenMVDebugOutputTask(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -259,6 +266,7 @@ static uint8_t QueueUartData(const uint8_t *data, uint16_t length)
 
 static void IMUDebugOutputTask(uint32_t now)
 {
+#if IMU_ENABLE
   const IMU_Status *status;
   char message[UART_TX_BUFFER_SIZE];
   int length;
@@ -316,6 +324,46 @@ static void IMUDebugOutputTask(uint32_t now)
                              ? (uint16_t)length : (uint16_t)(sizeof(message) - 1U);
     (void)QueueUartData((const uint8_t *)message, send_length);
   }
+#else
+  (void)now;
+#endif
+}
+
+static void OpenMVDebugOutputTask(void)
+{
+  const OpenMV_Status *status = OpenMV_GetStatus();
+  char message[UART_TX_BUFFER_SIZE];
+  int length = 0;
+
+  if (status->target_count != openmv_reported_target_count)
+  {
+    length = snprintf(message, sizeof(message),
+                      "OpenMV x:%u y:%u w:%u h:%u cx:%u cy:%u\r\n",
+                      (unsigned int)status->target.x,
+                      (unsigned int)status->target.y,
+                      (unsigned int)status->target.width,
+                      (unsigned int)status->target.height,
+                      (unsigned int)status->target.center_x,
+                      (unsigned int)status->target.center_y);
+    if ((length > 0) &&
+        (QueueUartData((const uint8_t *)message, (uint16_t)length) != 0U))
+    {
+      openmv_reported_target_count = status->target_count;
+    }
+  }
+  else if ((status->state == OPENMV_STATE_ERROR) &&
+           ((status->state != openmv_reported_state) ||
+            (status->error != openmv_reported_error)))
+  {
+    length = snprintf(message, sizeof(message), "OpenMV error:%u\r\n",
+                      (unsigned int)status->error);
+    if ((length > 0) &&
+        (QueueUartData((const uint8_t *)message, (uint16_t)length) != 0U))
+    {
+      openmv_reported_state = status->state;
+      openmv_reported_error = status->error;
+    }
+  }
 }
 /* USER CODE END 0 */
 
@@ -353,6 +401,7 @@ int main(void)
   MX_TIM3_Init();
   MX_TIM4_Init();
   MX_SPI1_Init();
+  MX_USART6_UART_Init();
   /* USER CODE BEGIN 2 */
   if ((HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1) != HAL_OK) ||
       (HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2) != HAL_OK) ||
@@ -372,8 +421,13 @@ int main(void)
   {
     Error_Handler();
   }
+#if IMU_ENABLE
   IMU_Init(&hspi1);
   imu_debug_tick = HAL_GetTick();
+#else
+  HAL_NVIC_DisableIRQ(EXTI15_10_IRQn);
+#endif
+  OpenMV_Init(&huart6);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -384,7 +438,10 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     uint32_t now = HAL_GetTick();
+#if IMU_ENABLE
     IMU_Task();
+#endif
+    OpenMV_Task();
     HandlePowerButton();
     UpdateBuzzer(now);
     if (flag_uart2 != 0U)
@@ -418,6 +475,16 @@ int main(void)
       buzzer_on = !buzzer_on;
       (void)QueueUartData(uart_reply, sizeof(uart_reply) - 1U);
     }
+    if (flag_openmv_start != 0U)
+    {
+      static const uint8_t start_message[] = "OpenMV start\r\n";
+      flag_openmv_start = 0U;
+      OpenMV_Start();
+      openmv_reported_target_count = 0U;
+      openmv_reported_state = OPENMV_STATE_IDLE;
+      openmv_reported_error = OPENMV_ERROR_NONE;
+      (void)QueueUartData(start_message, sizeof(start_message) - 1U);
+    }
     if (uart_overflow_pending != 0U)
     {
       static const uint8_t overflow_message[] = "UART RX overflow\r\n";
@@ -425,6 +492,7 @@ int main(void)
       (void)QueueUartData(overflow_message, sizeof(overflow_message) - 1U);
     }
     IMUDebugOutputTask(now);
+    OpenMVDebugOutputTask();
   }
   /* USER CODE END 3 */
 }
@@ -477,6 +545,11 @@ void SystemClock_Config(void)
 /* USER CODE BEGIN 4 */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
+  if (huart->Instance == USART6)
+  {
+    OpenMV_UART_RxCpltCallback();
+    return;
+  }
   if (huart->Instance != USART2)
   {
     return;
@@ -512,6 +585,10 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
       {
         flag_uart2_buzzer = 1U;
       }
+      if ((Uart2_Rx_Cnt == 3U) && (RxBuffer[0] == '6'))
+      {
+        flag_openmv_start = 1U;
+      }
       Uart2_Rx_Cnt = 0U;
       memset(RxBuffer, 0, sizeof(RxBuffer));
     }
@@ -527,11 +604,19 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
   {
     uart_tx_busy = 0U;
   }
+  else if (huart->Instance == USART6)
+  {
+    OpenMV_UART_TxCpltCallback();
+  }
 }
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
+#if IMU_ENABLE
   IMU_OnDataReady(GPIO_Pin);
+#else
+  (void)GPIO_Pin;
+#endif
 }
 
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
@@ -542,6 +627,10 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
     Uart2_Rx_Cnt = 0U;
     memset(RxBuffer, 0, sizeof(RxBuffer));
     HAL_UART_Receive_IT(&huart2, &aRxBuffer, 1);
+  }
+  else if (huart->Instance == USART6)
+  {
+    OpenMV_UART_ErrorCallback();
   }
 }
 /* USER CODE END 4 */
