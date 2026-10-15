@@ -1,0 +1,33 @@
+# Keil MDK build output
+MDK-ARM/Dart_v1/
+*.axf
+*.bin
+*.crf
+*.d
+*.dep
+*.hex
+*.htm
+*.lnp
+*.lst
+*.map
+*.o
+*.obj
+*.sct
+
+# Keil user-specific settings and debug state
+*.uvguix.*
+*.uvopt
+*.uvoptx
+*.dbgconf
+
+# Logs and temporary files
+*.log
+*.bak
+*.tmp
+*.lock
+
+# Editor and OS metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
