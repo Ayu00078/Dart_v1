@@ -18,12 +18,15 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "spi.h"
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "imu_task.h"
+#include <stdio.h>
 #include <string.h>
 /* USER CODE END Includes */
 
@@ -53,6 +56,8 @@ typedef enum
 #define EFFECT_BEEP_LENGTH_MS 180U
 #define EFFECT_BEEP_INTERVAL_MS 300U
 #define EFFECT_LENGTH_MS ((2U * EFFECT_BEEP_INTERVAL_MS) + EFFECT_BEEP_LENGTH_MS)
+#define UART_TX_BUFFER_SIZE 128U
+#define IMU_DEBUG_PERIOD_MS 200U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -75,6 +80,12 @@ static uint32_t power_button_tick;
 static uint32_t power_beep_tick;
 static uint32_t startup_effect_tick;
 static uint8_t startup_effect_active;
+static uint8_t uart_tx_buffer[UART_TX_BUFFER_SIZE];
+static volatile uint8_t uart_tx_busy;
+static volatile uint8_t uart_overflow_pending;
+static uint32_t uart_tx_drop_count;
+static uint32_t imu_debug_tick;
+static const uint8_t uart_reply[] = "ok\r\n";
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -84,6 +95,8 @@ static void SetServosPulse(uint32_t pulse);
 static uint32_t GetThreeBeepPulse(uint32_t elapsed, uint8_t increasing);
 static void UpdateBuzzer(uint32_t now);
 static void HandlePowerButton(void);
+static uint8_t QueueUartData(const uint8_t *data, uint16_t length);
+static void IMUDebugOutputTask(uint32_t now);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -216,6 +229,94 @@ static void HandlePowerButton(void)
       break;
   }
 }
+
+static uint8_t QueueUartData(const uint8_t *data, uint16_t length)
+{
+  HAL_StatusTypeDef result;
+
+  if ((data == NULL) || (length == 0U) || (length > UART_TX_BUFFER_SIZE))
+  {
+    return 0U;
+  }
+
+  __disable_irq();
+  if (uart_tx_busy != 0U)
+  {
+    __enable_irq();
+    uart_tx_drop_count++;
+    return 0U;
+  }
+  memcpy(uart_tx_buffer, data, length);
+  uart_tx_busy = 1U;
+  result = HAL_UART_Transmit_IT(&huart2, uart_tx_buffer, length);
+  if (result != HAL_OK)
+  {
+    uart_tx_busy = 0U;
+  }
+  __enable_irq();
+  return (result == HAL_OK) ? 1U : 0U;
+}
+
+static void IMUDebugOutputTask(uint32_t now)
+{
+  const IMU_Status *status;
+  char message[UART_TX_BUFFER_SIZE];
+  int length;
+  int32_t roll;
+  int32_t pitch;
+  int32_t yaw;
+  uint32_t roll_abs;
+  uint32_t pitch_abs;
+  uint32_t yaw_abs;
+
+  if ((uint32_t)(now - imu_debug_tick) < IMU_DEBUG_PERIOD_MS)
+  {
+    return;
+  }
+  imu_debug_tick = now;
+  status = IMU_GetStatus();
+  if (status->state == IMU_STATE_RUNNING)
+  {
+    roll = (int32_t)(status->roll_deg * 100.0f);
+    pitch = (int32_t)(status->pitch_deg * 100.0f);
+    yaw = (int32_t)(status->yaw_deg * 100.0f);
+    roll_abs = (roll < 0) ? (uint32_t)(-roll) : (uint32_t)roll;
+    pitch_abs = (pitch < 0) ? (uint32_t)(-pitch) : (uint32_t)pitch;
+    yaw_abs = (yaw < 0) ? (uint32_t)(-yaw) : (uint32_t)yaw;
+    length = snprintf(message, sizeof(message),
+                      "Roll:%s%lu.%02lu Pitch:%s%lu.%02lu Yaw:%s%lu.%02lu O:%lu E:%lu\r\n",
+                      (roll < 0) ? "-" : "", (unsigned long)(roll_abs / 100U),
+                      (unsigned long)(roll_abs % 100U),
+                      (pitch < 0) ? "-" : "", (unsigned long)(pitch_abs / 100U),
+                      (unsigned long)(pitch_abs % 100U),
+                      (yaw < 0) ? "-" : "", (unsigned long)(yaw_abs / 100U),
+                      (unsigned long)(yaw_abs % 100U),
+                      (unsigned long)status->gyro_overrun_count,
+                      (unsigned long)status->spi_error_count);
+  }
+  else if (status->state == IMU_STATE_CALIBRATING)
+  {
+    length = snprintf(message, sizeof(message), "IMU calibrating: keep still\r\n");
+  }
+  else
+  {
+    length = snprintf(message, sizeof(message),
+                      "IMU error:%u AccID:0x%02X GyrID:0x%02X V:%c R:%02X E:%02X A:%02X\r\n",
+                      (unsigned int)status->error,
+                      (unsigned int)status->accel_chip_id,
+                      (unsigned int)status->gyro_chip_id,
+                      status->verify_device,
+                      (unsigned int)status->verify_reg,
+                      (unsigned int)status->verify_expected,
+                      (unsigned int)status->verify_actual);
+  }
+  if (length > 0)
+  {
+    uint16_t send_length = ((uint32_t)length < sizeof(message))
+                             ? (uint16_t)length : (uint16_t)(sizeof(message) - 1U);
+    (void)QueueUartData((const uint8_t *)message, send_length);
+  }
+}
 /* USER CODE END 0 */
 
 /**
@@ -251,6 +352,7 @@ int main(void)
   MX_TIM2_Init();
   MX_TIM3_Init();
   MX_TIM4_Init();
+  MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
   if ((HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1) != HAL_OK) ||
       (HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2) != HAL_OK) ||
@@ -270,7 +372,8 @@ int main(void)
   {
     Error_Handler();
   }
-  static const uint8_t reply[] = "ok\r\n";
+  IMU_Init(&hspi1);
+  imu_debug_tick = HAL_GetTick();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -280,12 +383,14 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    uint32_t now = HAL_GetTick();
+    IMU_Task();
     HandlePowerButton();
-    UpdateBuzzer(HAL_GetTick());
+    UpdateBuzzer(now);
     if (flag_uart2 != 0U)
     {
       flag_uart2 = 0U;
-      HAL_UART_Transmit(&huart2, (uint8_t *)reply, sizeof(reply) - 1U, HAL_MAX_DELAY);
+      (void)QueueUartData(uart_reply, sizeof(uart_reply) - 1U);
     }
     if (servo_command != 0U)
     {
@@ -298,21 +403,28 @@ int main(void)
       if (command == 2U)
       {
         SetServosPulse(SERVO_0_DEG_PULSE);
-        HAL_UART_Transmit(&huart2, (uint8_t *)reply, sizeof(reply) - 1U, HAL_MAX_DELAY);
+        (void)QueueUartData(uart_reply, sizeof(uart_reply) - 1U);
 
       }
       else if (command == 3U)
       {
         SetServosPulse(SERVO_180_DEG_PULSE);
-        HAL_UART_Transmit(&huart2, (uint8_t *)reply, sizeof(reply) - 1U, HAL_MAX_DELAY);
+        (void)QueueUartData(uart_reply, sizeof(uart_reply) - 1U);
       }
     }
     if (flag_uart2_buzzer != 0U)
     {
       flag_uart2_buzzer = 0U;
       buzzer_on = !buzzer_on;
-      HAL_UART_Transmit(&huart2, (uint8_t *)reply, sizeof(reply) - 1U, HAL_MAX_DELAY);
+      (void)QueueUartData(uart_reply, sizeof(uart_reply) - 1U);
     }
+    if (uart_overflow_pending != 0U)
+    {
+      static const uint8_t overflow_message[] = "UART RX overflow\r\n";
+      uart_overflow_pending = 0U;
+      (void)QueueUartData(overflow_message, sizeof(overflow_message) - 1U);
+    }
+    IMUDebugOutputTask(now);
   }
   /* USER CODE END 3 */
 }
@@ -372,11 +484,9 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 
   if (Uart2_Rx_Cnt >= 255U)
   {
-    static const uint8_t overflow_message[] = "数据溢出";
     Uart2_Rx_Cnt = 0U;
     memset(RxBuffer, 0, sizeof(RxBuffer));
-    HAL_UART_Transmit(&huart2, (uint8_t *)overflow_message,
-                      sizeof(overflow_message) - 1U, HAL_MAX_DELAY);
+    uart_overflow_pending = 1U;
   }
   else
   {
@@ -411,10 +521,24 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
   HAL_UART_Receive_IT(&huart2, &aRxBuffer, 1);
 }
 
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART2)
+  {
+    uart_tx_busy = 0U;
+  }
+}
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  IMU_OnDataReady(GPIO_Pin);
+}
+
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
   if (huart->Instance == USART2)
   {
+    uart_tx_busy = 0U;
     Uart2_Rx_Cnt = 0U;
     memset(RxBuffer, 0, sizeof(RxBuffer));
     HAL_UART_Receive_IT(&huart2, &aRxBuffer, 1);
