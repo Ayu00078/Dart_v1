@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "adc.h"
 #include "spi.h"
 #include "tim.h"
 #include "usart.h"
@@ -47,7 +48,7 @@ typedef enum
 /* USER CODE BEGIN PD */
 #define RXBUFFERSIZE 256
 #define SERVO_0_DEG_PULSE 1000U
-#define SERVO_90_DEG_PULSE 1620U
+#define SERVO_90_DEG_PULSE 1620U//对齐齿，让舵机的机械臂位于中间
 #define SERVO_180_DEG_PULSE 2000U
 #define BUZZER_LOW_PULSE 10U
 #define BUZZER_MEDIUM_PULSE 20U
@@ -61,6 +62,10 @@ typedef enum
 #define UART_TX_BUFFER_SIZE 128U
 #define IMU_DEBUG_PERIOD_MS 200U
 #define IMU_ENABLE 0U
+#define BATTERY_ADC_SAMPLE_COUNT 16U
+#define BATTERY_ADC_FULL_SCALE 4095U
+#define BATTERY_ADC_REFERENCE_MV 3300U
+#define BATTERY_DIVIDER_RATIO 4U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -78,6 +83,7 @@ static volatile uint8_t flag_uart2;
 static volatile uint8_t servo_command;
 static volatile uint8_t flag_uart2_buzzer;
 static volatile uint8_t flag_openmv_start;
+static volatile uint8_t flag_battery_report;
 static uint8_t buzzer_on;
 static uint8_t servo_toggle_to_180;
 static PowerButtonState power_button_state;
@@ -106,6 +112,7 @@ static void HandlePowerButton(void);
 static uint8_t QueueUartData(const uint8_t *data, uint16_t length);
 static void IMUDebugOutputTask(uint32_t now);
 static void OpenMVDebugOutputTask(void);
+static uint8_t ReadBatteryVoltage(uint32_t *voltage_mv);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -116,6 +123,42 @@ static void SetServosPulse(uint32_t pulse)
   __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, pulse);
   __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, pulse);
   __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, pulse);
+}
+
+static uint8_t ReadBatteryVoltage(uint32_t *voltage_mv)
+{
+  uint32_t adc_sum = 0U;
+  uint32_t adc_average;
+  uint32_t sample_index;
+
+  if (voltage_mv == NULL)
+  {
+    return 0U;
+  }
+
+  for (sample_index = 0U; sample_index < BATTERY_ADC_SAMPLE_COUNT; sample_index++)
+  {
+    if (HAL_ADC_Start(&hadc1) != HAL_OK)
+    {
+      (void)HAL_ADC_Stop(&hadc1);
+      return 0U;
+    }
+    if (HAL_ADC_PollForConversion(&hadc1, 10U) != HAL_OK)
+    {
+      (void)HAL_ADC_Stop(&hadc1);
+      return 0U;
+    }
+    adc_sum += HAL_ADC_GetValue(&hadc1);
+    if (HAL_ADC_Stop(&hadc1) != HAL_OK)
+    {
+      return 0U;
+    }
+  }
+
+  adc_average = adc_sum / BATTERY_ADC_SAMPLE_COUNT;
+  *voltage_mv = ((adc_average * BATTERY_ADC_REFERENCE_MV * BATTERY_DIVIDER_RATIO) +
+                 (BATTERY_ADC_FULL_SCALE / 2U)) / BATTERY_ADC_FULL_SCALE;
+  return 1U;
 }
 
 static uint32_t GetThreeBeepPulse(uint32_t elapsed, uint8_t increasing)
@@ -404,6 +447,7 @@ int main(void)
   MX_TIM4_Init();
   MX_SPI1_Init();
   MX_USART6_UART_Init();
+  MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
   if ((HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1) != HAL_OK) ||
       (HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2) != HAL_OK) ||
@@ -495,6 +539,31 @@ int main(void)
       openmv_reported_state = OPENMV_STATE_IDLE;
       openmv_reported_error = OPENMV_ERROR_NONE;
       (void)QueueUartData(start_message, sizeof(start_message) - 1U);
+    }
+    if ((flag_battery_report != 0U) && (uart_tx_busy == 0U))
+    {
+      char battery_message[UART_TX_BUFFER_SIZE];
+      uint32_t battery_mv;
+      int length;
+
+      if (ReadBatteryVoltage(&battery_mv) != 0U)
+      {
+        length = snprintf(battery_message, sizeof(battery_message),
+                          "Battery:%lu.%02luV\r\n",
+                          (unsigned long)(battery_mv / 1000U),
+                          (unsigned long)((battery_mv % 1000U) / 10U));
+      }
+      else
+      {
+        length = snprintf(battery_message, sizeof(battery_message),
+                          "Battery ADC error\r\n");
+      }
+
+      if ((length > 0) &&
+          (QueueUartData((const uint8_t *)battery_message, (uint16_t)length) != 0U))
+      {
+        flag_battery_report = 0U;
+      }
     }
     if (uart_overflow_pending != 0U)
     {
@@ -599,6 +668,10 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
       if ((Uart2_Rx_Cnt == 3U) && (RxBuffer[0] == '6'))
       {
         flag_openmv_start = 1U;
+      }
+      if ((Uart2_Rx_Cnt == 3U) && (RxBuffer[0] == '8'))
+      {
+        flag_battery_report = 1U;
       }
       Uart2_Rx_Cnt = 0U;
       memset(RxBuffer, 0, sizeof(RxBuffer));
