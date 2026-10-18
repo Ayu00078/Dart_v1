@@ -170,6 +170,11 @@ void IMU_Task(void)
   {
     return;
   }
+  imu_status.accel_norm_mps2 = sqrtf(latest_accel[0] * latest_accel[0] +
+                                      latest_accel[1] * latest_accel[1] +
+                                      latest_accel[2] * latest_accel[2]);
+  imu_status.gyro_norm_rps = sqrtf(gyro[0] * gyro[0] + gyro[1] * gyro[1] +
+                                   gyro[2] * gyro[2]);
 
   if (imu_status.state == IMU_STATE_CALIBRATING)
   {

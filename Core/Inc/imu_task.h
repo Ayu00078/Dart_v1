@@ -28,6 +28,8 @@ typedef struct
   float roll_deg;
   float pitch_deg;
   float yaw_deg;
+  float accel_norm_mps2;
+  float gyro_norm_rps;
   uint32_t gyro_drdy_count;
   uint32_t accel_drdy_count;
   uint32_t gyro_overrun_count;

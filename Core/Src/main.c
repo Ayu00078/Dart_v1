@@ -42,14 +42,56 @@ typedef enum
   POWER_WAIT_RELEASE,
   POWER_TIMING_RELEASE
 } PowerButtonState;
+typedef enum
+{
+  FLIGHT_IDLE, FLIGHT_WAIT_LAUNCH, FLIGHT_ASCENDING, FLIGHT_LANDING,
+  FLIGHT_IMU_ERROR
+} FlightState;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define RXBUFFERSIZE 256
-#define SERVO_0_DEG_PULSE 1000U
-#define SERVO_90_DEG_PULSE 1620U//对齐齿，让舵机的机械臂位于中间
-#define SERVO_180_DEG_PULSE 2000U
+#define RXBUFFERSIZE 32U
+/* Existing endpoint commands used these values; verify actual servo and linkage
+   before energizing. Never widen this envelope without hardware validation. */
+#define SERVO_MIN_PULSE_US 1000U
+#define SERVO_MAX_PULSE_US 2000U
+#define SERVO_DEFAULT_PULSE_US 1620U
+#define SERVO_1_TAKEOFF_PULSE_US 1620U
+#define SERVO_2_TAKEOFF_PULSE_US 1620U
+#define SERVO_3_TAKEOFF_PULSE_US 1620U
+#define SERVO_4_TAKEOFF_PULSE_US 1620U
+#define SERVO_1_LANDING_PULSE_US 1620U
+#define SERVO_2_LANDING_PULSE_US 1620U
+#define SERVO_3_LANDING_PULSE_US 1620U
+#define SERVO_4_LANDING_PULSE_US 1620U
+#define SERVO_PWM_PERIOD_US 20000U
+#define FLIGHT_AUTO_ARM_MS 10000U
+#define ARM_BEEP_LENGTH_MS 150U
+#define ARM_BEEP_INTERVAL_MS 300U
+#define ARM_BEEP_TOTAL_MS (ARM_BEEP_INTERVAL_MS + ARM_BEEP_LENGTH_MS)
+#if (SERVO_DEFAULT_PULSE_US < SERVO_MIN_PULSE_US) || (SERVO_DEFAULT_PULSE_US > SERVO_MAX_PULSE_US) || \
+    (SERVO_1_TAKEOFF_PULSE_US < SERVO_MIN_PULSE_US) || (SERVO_1_TAKEOFF_PULSE_US > SERVO_MAX_PULSE_US) || \
+    (SERVO_2_TAKEOFF_PULSE_US < SERVO_MIN_PULSE_US) || (SERVO_2_TAKEOFF_PULSE_US > SERVO_MAX_PULSE_US) || \
+    (SERVO_3_TAKEOFF_PULSE_US < SERVO_MIN_PULSE_US) || (SERVO_3_TAKEOFF_PULSE_US > SERVO_MAX_PULSE_US) || \
+    (SERVO_4_TAKEOFF_PULSE_US < SERVO_MIN_PULSE_US) || (SERVO_4_TAKEOFF_PULSE_US > SERVO_MAX_PULSE_US) || \
+    (SERVO_1_LANDING_PULSE_US < SERVO_MIN_PULSE_US) || (SERVO_1_LANDING_PULSE_US > SERVO_MAX_PULSE_US) || \
+    (SERVO_2_LANDING_PULSE_US < SERVO_MIN_PULSE_US) || (SERVO_2_LANDING_PULSE_US > SERVO_MAX_PULSE_US) || \
+    (SERVO_3_LANDING_PULSE_US < SERVO_MIN_PULSE_US) || (SERVO_3_LANDING_PULSE_US > SERVO_MAX_PULSE_US) || \
+    (SERVO_4_LANDING_PULSE_US < SERVO_MIN_PULSE_US) || (SERVO_4_LANDING_PULSE_US > SERVO_MAX_PULSE_US)
+#error "Servo preset pulse is outside the configured envelope"
+#endif
+/* Launch gate: tune acceleration magnitude and continuous time separately. */
+#define FLIGHT_LAUNCH_ACCEL_MPS2 13.0f
+#define FLIGHT_LAUNCH_CONFIRM_MS 6U
+/* Consecutive positive roll updates required after a negative-to-positive crossing. */
+#define FLIGHT_ROLL_POSITIVE_SAMPLES 5U
+#define FLIGHT_BEEP_MS 3000U
+#define FLIGHT_LANDING_HOLD_MS 5000U
+#define BATTERY_ADC_SAMPLE_COUNT 4U
+#define BATTERY_ADC_FULL_SCALE 4095U
+#define BATTERY_ADC_REFERENCE_MV 3300U
+#define BATTERY_DIVIDER_RATIO 4U
 #define BUZZER_LOW_PULSE 10U
 #define BUZZER_MEDIUM_PULSE 20U
 #define BUZZER_HIGH_PULSE 40U
@@ -59,13 +101,8 @@ typedef enum
 #define EFFECT_BEEP_LENGTH_MS 180U
 #define EFFECT_BEEP_INTERVAL_MS 300U
 #define EFFECT_LENGTH_MS ((2U * EFFECT_BEEP_INTERVAL_MS) + EFFECT_BEEP_LENGTH_MS)
-#define UART_TX_BUFFER_SIZE 128U
+#define UART_TX_BUFFER_SIZE 256U
 #define IMU_DEBUG_PERIOD_MS 200U
-#define IMU_ENABLE 0U
-#define BATTERY_ADC_SAMPLE_COUNT 16U
-#define BATTERY_ADC_FULL_SCALE 4095U
-#define BATTERY_ADC_REFERENCE_MV 3300U
-#define BATTERY_DIVIDER_RATIO 4U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -77,20 +114,34 @@ typedef enum
 
 /* USER CODE BEGIN PV */
 static char RxBuffer[RXBUFFERSIZE];
+static char command_buffer[RXBUFFERSIZE];
 static uint8_t aRxBuffer;
 static uint8_t Uart2_Rx_Cnt;
-static volatile uint8_t flag_uart2;
-static volatile uint8_t servo_command;
-static volatile uint8_t flag_uart2_buzzer;
-static volatile uint8_t flag_openmv_start;
-static volatile uint8_t flag_battery_report;
-static uint8_t buzzer_on;
-static uint8_t servo_toggle_to_180;
+static volatile uint8_t command_ready;
+static volatile uint8_t rx_discard;
+static uint32_t takeoff_pulse[4] = { SERVO_1_TAKEOFF_PULSE_US, SERVO_2_TAKEOFF_PULSE_US,
+                                     SERVO_3_TAKEOFF_PULSE_US, SERVO_4_TAKEOFF_PULSE_US };
+static uint32_t landing_pulse[4] = { SERVO_1_LANDING_PULSE_US, SERVO_2_LANDING_PULSE_US,
+                                     SERVO_3_LANDING_PULSE_US, SERVO_4_LANDING_PULSE_US };
+static FlightState flight_state;
+static uint32_t launch_tick;
+static uint32_t launch_candidate_tick;
+static uint32_t apex_tick;
+static uint32_t flight_last_update;
+static uint8_t launch_candidate;
+static uint8_t roll_was_negative;
+static uint8_t roll_positive_count;
+static uint8_t apex_event;
+static uint8_t servo_output_active = 1U;
+static uint8_t battery_report_pending;
 static PowerButtonState power_button_state;
 static uint32_t power_button_tick;
 static uint32_t power_beep_tick;
 static uint32_t startup_effect_tick;
 static uint8_t startup_effect_active;
+static uint32_t boot_tick;
+static uint32_t arm_beep_tick;
+static uint8_t arm_beep_active;
 static uint8_t uart_tx_buffer[UART_TX_BUFFER_SIZE];
 static volatile uint8_t uart_tx_busy;
 static volatile uint8_t uart_overflow_pending;
@@ -100,65 +151,85 @@ static uint32_t openmv_reported_target_count;
 static OpenMV_State openmv_reported_state;
 static OpenMV_Error openmv_reported_error;
 static const uint8_t uart_reply[] = "ok\r\n";
+static const uint8_t uart_error[] = "error\r\n";
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-static void SetServosPulse(uint32_t pulse);
+static void SetServoPulse(uint8_t index, uint32_t pulse);
+static uint8_t ReadBatteryVoltage(uint32_t *voltage_mv);
+static void BatteryReportTask(void);
+static void HandleFlightCommand(void);
+static void FlightTask(uint32_t now);
+static uint8_t ArmFlight(uint32_t now);
+static void AutoArmTask(uint32_t now);
 static uint32_t GetThreeBeepPulse(uint32_t elapsed, uint8_t increasing);
 static void UpdateBuzzer(uint32_t now);
 static void HandlePowerButton(void);
 static uint8_t QueueUartData(const uint8_t *data, uint16_t length);
 static void IMUDebugOutputTask(uint32_t now);
 static void OpenMVDebugOutputTask(void);
-static uint8_t ReadBatteryVoltage(uint32_t *voltage_mv);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-static void SetServosPulse(uint32_t pulse)
+static void SetServoPulse(uint8_t index, uint32_t pulse)
 {
-  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, pulse);
-  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, pulse);
-  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, pulse);
-  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, pulse);
+  switch (index)
+  {
+    case 0U: __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, pulse); break;
+    case 1U: __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, pulse); break;
+    case 2U: __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, pulse); break;
+    case 3U: __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, pulse); break;
+    default: break;
+  }
 }
 
 static uint8_t ReadBatteryVoltage(uint32_t *voltage_mv)
 {
-  uint32_t adc_sum = 0U;
-  uint32_t adc_average;
-  uint32_t sample_index;
+  uint32_t sum = 0U;
+  uint32_t i;
 
-  if (voltage_mv == NULL)
-  {
-    return 0U;
-  }
-
-  for (sample_index = 0U; sample_index < BATTERY_ADC_SAMPLE_COUNT; sample_index++)
+  if (voltage_mv == NULL) return 0U;
+  for (i = 0U; i < BATTERY_ADC_SAMPLE_COUNT; i++)
   {
     if (HAL_ADC_Start(&hadc1) != HAL_OK)
     {
       (void)HAL_ADC_Stop(&hadc1);
       return 0U;
     }
-    if (HAL_ADC_PollForConversion(&hadc1, 10U) != HAL_OK)
+    if (HAL_ADC_PollForConversion(&hadc1, 1U) != HAL_OK)
     {
       (void)HAL_ADC_Stop(&hadc1);
       return 0U;
     }
-    adc_sum += HAL_ADC_GetValue(&hadc1);
-    if (HAL_ADC_Stop(&hadc1) != HAL_OK)
-    {
-      return 0U;
-    }
+    sum += HAL_ADC_GetValue(&hadc1);
+    if (HAL_ADC_Stop(&hadc1) != HAL_OK) return 0U;
   }
-
-  adc_average = adc_sum / BATTERY_ADC_SAMPLE_COUNT;
-  *voltage_mv = ((adc_average * BATTERY_ADC_REFERENCE_MV * BATTERY_DIVIDER_RATIO) +
+  *voltage_mv = (((sum / BATTERY_ADC_SAMPLE_COUNT) *
+                  BATTERY_ADC_REFERENCE_MV * BATTERY_DIVIDER_RATIO) +
                  (BATTERY_ADC_FULL_SCALE / 2U)) / BATTERY_ADC_FULL_SCALE;
   return 1U;
+}
+
+static void BatteryReportTask(void)
+{
+  char message[UART_TX_BUFFER_SIZE];
+  uint32_t voltage_mv;
+  int length;
+
+  if ((battery_report_pending == 0U) || (uart_tx_busy != 0U)) return;
+  if (ReadBatteryVoltage(&voltage_mv) != 0U)
+  {
+    length = snprintf(message, sizeof(message), "Battery:%lu.%02luV\r\n",
+                      (unsigned long)(voltage_mv / 1000U),
+                      (unsigned long)((voltage_mv % 1000U) / 10U));
+  }
+  else length = snprintf(message, sizeof(message), "Battery ADC error\r\n");
+  if ((length > 0) && ((uint32_t)length < sizeof(message)) &&
+      (QueueUartData((const uint8_t *)message, (uint16_t)length) != 0U))
+    battery_report_pending = 0U;
 }
 
 static uint32_t GetThreeBeepPulse(uint32_t elapsed, uint8_t increasing)
@@ -187,7 +258,11 @@ static void UpdateBuzzer(uint32_t now)
 {
   uint32_t pulse;
 
-  if (power_button_state == POWER_WAIT_RELEASE)
+  if ((apex_event != 0U) && ((uint32_t)(now - apex_tick) < FLIGHT_BEEP_MS))
+  {
+    pulse = BUZZER_HIGH_PULSE;
+  }
+  else if (power_button_state == POWER_WAIT_RELEASE)
   {
     pulse = ((uint32_t)(now - power_beep_tick) < POWER_RELEASE_BEEP_MS)
               ? BUZZER_HIGH_PULSE : 0U;
@@ -195,6 +270,21 @@ static void UpdateBuzzer(uint32_t now)
   else if (power_button_state == POWER_TIMING_RELEASE)
   {
     pulse = GetThreeBeepPulse((uint32_t)(now - power_button_tick), 0U);
+  }
+  else if (arm_beep_active != 0U)
+  {
+    uint32_t elapsed = (uint32_t)(now - arm_beep_tick);
+    if (elapsed < ARM_BEEP_TOTAL_MS)
+    {
+      pulse = ((elapsed < ARM_BEEP_LENGTH_MS) ||
+               ((elapsed >= ARM_BEEP_INTERVAL_MS) &&
+                (elapsed < ARM_BEEP_TOTAL_MS))) ? BUZZER_HIGH_PULSE : 0U;
+    }
+    else
+    {
+      arm_beep_active = 0U;
+      pulse = 0U;
+    }
   }
   else if (startup_effect_active != 0U)
   {
@@ -207,12 +297,12 @@ static void UpdateBuzzer(uint32_t now)
     else
     {
       startup_effect_active = 0U;
-      pulse = buzzer_on ? BUZZER_HIGH_PULSE : 0U;
+      pulse = 0U;
     }
   }
   else
   {
-    pulse = buzzer_on ? BUZZER_HIGH_PULSE : 0U;
+    pulse = 0U;
   }
 
   __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, pulse);
@@ -309,18 +399,198 @@ static uint8_t QueueUartData(const uint8_t *data, uint16_t length)
   return (result == HAL_OK) ? 1U : 0U;
 }
 
+static uint8_t ArmFlight(uint32_t now)
+{
+  const IMU_Status *status = IMU_GetStatus();
+  uint8_t i;
+
+  if ((flight_state == FLIGHT_ASCENDING) ||
+      (status->state != IMU_STATE_RUNNING) ||
+      ((apex_event != 0U) &&
+       ((uint32_t)(now - apex_tick) < FLIGHT_LANDING_HOLD_MS))) return 0U;
+
+  for (i = 0U; i < 4U; i++) SetServoPulse(i, takeoff_pulse[i]);
+  servo_output_active = 1U;
+  flight_state = FLIGHT_WAIT_LAUNCH;
+  launch_candidate = 0U;
+  roll_was_negative = 0U;
+  roll_positive_count = 0U;
+  apex_event = 0U;
+  flight_last_update = status->attitude_update_count;
+  return 1U;
+}
+
+static void AutoArmTask(uint32_t now)
+{
+  if ((flight_state != FLIGHT_IDLE) ||
+      ((uint32_t)(now - boot_tick) < FLIGHT_AUTO_ARM_MS) ||
+      (IMU_GetStatus()->state != IMU_STATE_RUNNING)) return;
+
+  if (ArmFlight(now) != 0U)
+  {
+    startup_effect_active = 0U;
+    arm_beep_tick = now;
+    arm_beep_active = 1U;
+  }
+}
+
+static void HandleFlightCommand(void)
+{
+  char line[RXBUFFERSIZE];
+  uint8_t length;
+  uint8_t number;
+  uint8_t index;
+  uint32_t pulse = 0U;
+  uint8_t valid = 1U;
+  uint8_t i;
+  uint8_t digits = 0U;
+
+  if (command_ready == 0U)
+  {
+    return;
+  }
+  __disable_irq();
+  length = command_ready;
+  memcpy(line, command_buffer, length);
+  command_ready = 0U;
+  __enable_irq();
+  line[length] = '\0';
+  if ((length == 1U) && (line[0] == '0'))
+  {
+    battery_report_pending = 1U;
+    return;
+  }
+  if ((length == 1U) && (line[0] == '5'))
+  {
+    valid = ArmFlight(HAL_GetTick());
+  }
+  else if ((length >= 6U) && (line[0] >= '1') && (line[0] <= '9') &&
+           (line[1] == ' '))
+  {
+    number = (uint8_t)(line[0] - '0');
+    valid = ((number >= 1U && number <= 4U) ||
+             (number >= 6U && number <= 9U)) ? 1U : 0U;
+    for (i = 2U; i < length; i++)
+    {
+      if ((line[i] < '0') || (line[i] > '9') || (pulse > SERVO_PWM_PERIOD_US))
+      {
+        valid = 0U;
+        break;
+      }
+      pulse = pulse * 10U + (uint32_t)(line[i] - '0');
+      digits++;
+    }
+    if ((digits == 0U) ||
+        (pulse < SERVO_MIN_PULSE_US) || (pulse > SERVO_MAX_PULSE_US) ||
+        (pulse >= SERVO_PWM_PERIOD_US)) valid = 0U;
+    if (valid != 0U)
+    {
+      index = (number <= 4U) ? (uint8_t)(number - 1U) : (uint8_t)(number - 6U);
+      if (number <= 4U)
+      {
+        /* Landing is latched: never silently override its output. */
+        if ((flight_state == FLIGHT_LANDING) ||
+            (flight_state == FLIGHT_ASCENDING)) valid = 0U;
+        else
+        {
+          takeoff_pulse[index] = pulse;
+          SetServoPulse(index, pulse);
+          servo_output_active = 1U;
+        }
+      }
+      else if ((flight_state == FLIGHT_WAIT_LAUNCH) ||
+               (flight_state == FLIGHT_ASCENDING)) valid = 0U;
+      else
+      {
+        landing_pulse[index] = pulse;
+      }
+    }
+  }
+  else valid = 0U;
+  (void)QueueUartData(valid ? uart_reply : uart_error,
+                      valid ? (sizeof(uart_reply) - 1U) : (sizeof(uart_error) - 1U));
+}
+
+static void FlightTask(uint32_t now)
+{
+  const IMU_Status *imu = IMU_GetStatus();
+  uint8_t i;
+  if ((flight_state == FLIGHT_LANDING) && (servo_output_active != 0U) &&
+      ((uint32_t)(now - apex_tick) >= FLIGHT_LANDING_HOLD_MS))
+  {
+    for (i = 0U; i < 4U; i++) SetServoPulse(i, 0U);
+    servo_output_active = 0U;
+  }
+  if ((flight_state == FLIGHT_WAIT_LAUNCH) || (flight_state == FLIGHT_ASCENDING))
+  {
+    if (imu->state != IMU_STATE_RUNNING)
+    {
+      flight_state = FLIGHT_IMU_ERROR;
+      return;
+    }
+    if (imu->attitude_update_count == flight_last_update) return;
+    flight_last_update = imu->attitude_update_count;
+    if (flight_state == FLIGHT_WAIT_LAUNCH)
+    {
+      if (imu->accel_norm_mps2 >= FLIGHT_LAUNCH_ACCEL_MPS2)
+      {
+        if (launch_candidate == 0U)
+        {
+          launch_candidate_tick = now;
+          launch_candidate = 1U;
+        }
+        else if ((uint32_t)(now - launch_candidate_tick) >= FLIGHT_LAUNCH_CONFIRM_MS)
+        {
+          launch_tick = now;
+          launch_candidate = 0U;
+          roll_was_negative = 0U;
+          roll_positive_count = 0U;
+          flight_state = FLIGHT_ASCENDING;
+        }
+      }
+      else launch_candidate = 0U;
+    }
+    else
+    {
+      /* Only post-launch attitude updates count. Zero breaks a positive run;
+         a later negative sample allows another crossing attempt. */
+      if (imu->roll_deg < 0.0f)
+      {
+        roll_was_negative = 1U;
+        roll_positive_count = 0U;
+      }
+      else if (imu->roll_deg > 0.0f)
+      {
+        if (roll_was_negative != 0U)
+        {
+          roll_positive_count++;
+          if (roll_positive_count >= FLIGHT_ROLL_POSITIVE_SAMPLES)
+          {
+            flight_state = FLIGHT_LANDING;
+            apex_event = 1U;
+            apex_tick = now;
+            for (i = 0U; i < 4U; i++) SetServoPulse(i, landing_pulse[i]);
+            __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, BUZZER_HIGH_PULSE);
+          }
+        }
+      }
+      else
+      {
+        roll_was_negative = 0U;
+        roll_positive_count = 0U;
+      }
+    }
+  }
+}
+
 static void IMUDebugOutputTask(uint32_t now)
 {
-#if IMU_ENABLE
   const IMU_Status *status;
   char message[UART_TX_BUFFER_SIZE];
   int length;
   int32_t roll;
   int32_t pitch;
   int32_t yaw;
-  uint32_t roll_abs;
-  uint32_t pitch_abs;
-  uint32_t yaw_abs;
 
   if ((uint32_t)(now - imu_debug_tick) < IMU_DEBUG_PERIOD_MS)
   {
@@ -328,50 +598,35 @@ static void IMUDebugOutputTask(uint32_t now)
   }
   imu_debug_tick = now;
   status = IMU_GetStatus();
-  if (status->state == IMU_STATE_RUNNING)
+  roll = (int32_t)(status->roll_deg * 10.0f);
+  pitch = (int32_t)(status->pitch_deg * 10.0f);
+  yaw = (int32_t)(status->yaw_deg * 10.0f);
+  /* R/P/Y remain in tenths of a degree for existing parsers; X/Y/Z are
+     the same Euler angles (roll/pitch/yaw) formatted in degrees. */
+  length = snprintf(message, sizeof(message),
+                     "ms:%lu F:%u I:%u e:%u R:%ld P:%ld Y:%ld Xdeg:%s%ld.%01ld Ydeg:%s%ld.%01ld Zdeg:%s%ld.%01ld A:%lu G:%lu C:%u T:%lu V:%u B:%u S:%u U:%lu O:%lu E:%lu\r\n",
+                     (unsigned long)now, (unsigned int)flight_state, (unsigned int)status->state,
+                     (unsigned int)status->error, (long)roll, (long)pitch, (long)yaw,
+                     (roll < 0) ? "-" : "", (long)((roll < 0) ? -roll : roll) / 10L,
+                     (long)((roll < 0) ? -roll : roll) % 10L,
+                     (pitch < 0) ? "-" : "", (long)((pitch < 0) ? -pitch : pitch) / 10L,
+                     (long)((pitch < 0) ? -pitch : pitch) % 10L,
+                     (yaw < 0) ? "-" : "", (long)((yaw < 0) ? -yaw : yaw) / 10L,
+                     (long)((yaw < 0) ? -yaw : yaw) % 10L,
+                     (unsigned long)(status->accel_norm_mps2 * 100.0f),
+                     (unsigned long)(status->gyro_norm_rps * 100.0f),
+                     (unsigned int)launch_candidate,
+                     (unsigned long)((flight_state == FLIGHT_ASCENDING) ? (now - launch_tick) : 0U),
+                     (unsigned int)apex_event,
+                     (unsigned int)(apex_event && ((uint32_t)(now - apex_tick) < FLIGHT_BEEP_MS)),
+                     (unsigned int)servo_output_active,
+                     (unsigned long)status->attitude_update_count,
+                     (unsigned long)status->gyro_overrun_count,
+                     (unsigned long)status->spi_error_count);
+  if ((length > 0) && ((uint32_t)length < sizeof(message)))
   {
-    roll = (int32_t)(status->roll_deg * 100.0f);
-    pitch = (int32_t)(status->pitch_deg * 100.0f);
-    yaw = (int32_t)(status->yaw_deg * 100.0f);
-    roll_abs = (roll < 0) ? (uint32_t)(-roll) : (uint32_t)roll;
-    pitch_abs = (pitch < 0) ? (uint32_t)(-pitch) : (uint32_t)pitch;
-    yaw_abs = (yaw < 0) ? (uint32_t)(-yaw) : (uint32_t)yaw;
-    length = snprintf(message, sizeof(message),
-                      "Roll:%s%lu.%02lu Pitch:%s%lu.%02lu Yaw:%s%lu.%02lu O:%lu E:%lu\r\n",
-                      (roll < 0) ? "-" : "", (unsigned long)(roll_abs / 100U),
-                      (unsigned long)(roll_abs % 100U),
-                      (pitch < 0) ? "-" : "", (unsigned long)(pitch_abs / 100U),
-                      (unsigned long)(pitch_abs % 100U),
-                      (yaw < 0) ? "-" : "", (unsigned long)(yaw_abs / 100U),
-                      (unsigned long)(yaw_abs % 100U),
-                      (unsigned long)status->gyro_overrun_count,
-                      (unsigned long)status->spi_error_count);
+    (void)QueueUartData((const uint8_t *)message, (uint16_t)length);
   }
-  else if (status->state == IMU_STATE_CALIBRATING)
-  {
-    length = snprintf(message, sizeof(message), "IMU calibrating: keep still\r\n");
-  }
-  else
-  {
-    length = snprintf(message, sizeof(message),
-                      "IMU error:%u AccID:0x%02X GyrID:0x%02X V:%c R:%02X E:%02X A:%02X\r\n",
-                      (unsigned int)status->error,
-                      (unsigned int)status->accel_chip_id,
-                      (unsigned int)status->gyro_chip_id,
-                      status->verify_device,
-                      (unsigned int)status->verify_reg,
-                      (unsigned int)status->verify_expected,
-                      (unsigned int)status->verify_actual);
-  }
-  if (length > 0)
-  {
-    uint16_t send_length = ((uint32_t)length < sizeof(message))
-                             ? (uint16_t)length : (uint16_t)(sizeof(message) - 1U);
-    (void)QueueUartData((const uint8_t *)message, send_length);
-  }
-#else
-  (void)now;
-#endif
 }
 
 static void OpenMVDebugOutputTask(void)
@@ -456,23 +711,24 @@ int main(void)
   {
     Error_Handler();
   }
+  {
+    uint8_t i;
+    for (i = 0U; i < 4U; i++) SetServoPulse(i, SERVO_DEFAULT_PULSE_US);
+  }
   __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, 0U);
   if (HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1) != HAL_OK)
   {
     Error_Handler();
   }
-  startup_effect_tick = HAL_GetTick();
+  boot_tick = HAL_GetTick();
+  startup_effect_tick = boot_tick;
   startup_effect_active = 1U;
   if (HAL_UART_Receive_IT(&huart2, &aRxBuffer, 1) != HAL_OK)
   {
     Error_Handler();
   }
-#if IMU_ENABLE
   IMU_Init(&hspi1);
   imu_debug_tick = HAL_GetTick();
-#else
-  HAL_NVIC_DisableIRQ(EXTI15_10_IRQn);
-#endif
   OpenMV_Init(&huart6);
   /* USER CODE END 2 */
 
@@ -484,92 +740,19 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     uint32_t now = HAL_GetTick();
-#if IMU_ENABLE
     IMU_Task();
-#endif
+    HandleFlightCommand();
+    AutoArmTask(now);
+    FlightTask(now);
+    BatteryReportTask();
     OpenMV_Task();
     HandlePowerButton();
     UpdateBuzzer(now);
-    if (flag_uart2 != 0U)
-    {
-      flag_uart2 = 0U;
-      (void)QueueUartData(uart_reply, sizeof(uart_reply) - 1U);
-    }
-    if (servo_command != 0U)
-    {
-      uint8_t command;
-      __disable_irq();
-      command = servo_command;
-      servo_command = 0U;
-      __enable_irq();
-
-      if (command == 2U)
-      {
-        if (servo_toggle_to_180 == 0U)
-        {
-          SetServosPulse(SERVO_0_DEG_PULSE);
-          servo_toggle_to_180 = 1U;
-        }
-        else
-        {
-          SetServosPulse(SERVO_180_DEG_PULSE);
-          servo_toggle_to_180 = 0U;
-        }
-        (void)QueueUartData(uart_reply, sizeof(uart_reply) - 1U);
-      }
-      else if (command == 3U)
-      {
-        SetServosPulse(SERVO_90_DEG_PULSE);
-        servo_toggle_to_180 = 1U;
-        (void)QueueUartData(uart_reply, sizeof(uart_reply) - 1U);
-      }
-    }
-    if (flag_uart2_buzzer != 0U)
-    {
-      flag_uart2_buzzer = 0U;
-      buzzer_on = !buzzer_on;
-      (void)QueueUartData(uart_reply, sizeof(uart_reply) - 1U);
-    }
-    if (flag_openmv_start != 0U)
-    {
-      static const uint8_t start_message[] = "OpenMV start\r\n";
-      flag_openmv_start = 0U;
-      OpenMV_Start();
-      openmv_reported_target_count = 0U;
-      openmv_reported_state = OPENMV_STATE_IDLE;
-      openmv_reported_error = OPENMV_ERROR_NONE;
-      (void)QueueUartData(start_message, sizeof(start_message) - 1U);
-    }
-    if ((flag_battery_report != 0U) && (uart_tx_busy == 0U))
-    {
-      char battery_message[UART_TX_BUFFER_SIZE];
-      uint32_t battery_mv;
-      int length;
-
-      if (ReadBatteryVoltage(&battery_mv) != 0U)
-      {
-        length = snprintf(battery_message, sizeof(battery_message),
-                          "Battery:%lu.%02luV\r\n",
-                          (unsigned long)(battery_mv / 1000U),
-                          (unsigned long)((battery_mv % 1000U) / 10U));
-      }
-      else
-      {
-        length = snprintf(battery_message, sizeof(battery_message),
-                          "Battery ADC error\r\n");
-      }
-
-      if ((length > 0) &&
-          (QueueUartData((const uint8_t *)battery_message, (uint16_t)length) != 0U))
-      {
-        flag_battery_report = 0U;
-      }
-    }
     if (uart_overflow_pending != 0U)
     {
       static const uint8_t overflow_message[] = "UART RX overflow\r\n";
-      uart_overflow_pending = 0U;
-      (void)QueueUartData(overflow_message, sizeof(overflow_message) - 1U);
+      if (QueueUartData(overflow_message, sizeof(overflow_message) - 1U))
+        uart_overflow_pending = 0U;
     }
     IMUDebugOutputTask(now);
     OpenMVDebugOutputTask();
@@ -635,48 +818,43 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     return;
   }
 
-  if (Uart2_Rx_Cnt >= 255U)
+  if (rx_discard != 0U)
   {
-    Uart2_Rx_Cnt = 0U;
-    memset(RxBuffer, 0, sizeof(RxBuffer));
-    uart_overflow_pending = 1U;
+    if ((Uart2_Rx_Cnt != 0U) && (RxBuffer[0] == '\r') && (aRxBuffer == '\n'))
+    {
+      rx_discard = 0U;
+      Uart2_Rx_Cnt = 0U;
+    }
+    else
+    {
+      RxBuffer[0] = (char)aRxBuffer;
+      Uart2_Rx_Cnt = 1U;
+    }
   }
   else
   {
-    RxBuffer[Uart2_Rx_Cnt++] = aRxBuffer;
-
-    if ((Uart2_Rx_Cnt >= 2U) &&
-        (RxBuffer[Uart2_Rx_Cnt - 1U] == '\n') &&
-        (RxBuffer[Uart2_Rx_Cnt - 2U] == '\r'))
+    if (Uart2_Rx_Cnt >= (RXBUFFERSIZE - 1U))
     {
-      if ((Uart2_Rx_Cnt >= 3U) && (RxBuffer[Uart2_Rx_Cnt - 3U] == '1'))
-      {
-        flag_uart2 = 1U;
-      }
-      if ((Uart2_Rx_Cnt >= 3U) && (RxBuffer[Uart2_Rx_Cnt - 3U] == '2'))
-      {
-        servo_command = 2U;
-      }
-      if ((Uart2_Rx_Cnt >= 3U) && (RxBuffer[Uart2_Rx_Cnt - 3U] == '3'))
-      {
-        servo_command = 3U;
-      }
-      if ((Uart2_Rx_Cnt >= 3U) && (RxBuffer[Uart2_Rx_Cnt - 3U] == '4'))
-      {
-        flag_uart2_buzzer = 1U;
-      }
-      if ((Uart2_Rx_Cnt == 3U) && (RxBuffer[0] == '6'))
-      {
-        flag_openmv_start = 1U;
-      }
-      if ((Uart2_Rx_Cnt == 3U) && (RxBuffer[0] == '8'))
-      {
-        flag_battery_report = 1U;
-      }
+      rx_discard = 1U;
       Uart2_Rx_Cnt = 0U;
-      memset(RxBuffer, 0, sizeof(RxBuffer));
+      uart_overflow_pending = 1U;
     }
-    
+    else
+    {
+      RxBuffer[Uart2_Rx_Cnt++] = (char)aRxBuffer;
+      if ((Uart2_Rx_Cnt >= 2U) && (RxBuffer[Uart2_Rx_Cnt - 2U] == '\r') &&
+          (RxBuffer[Uart2_Rx_Cnt - 1U] == '\n'))
+      {
+        if (command_ready == 0U)
+        {
+          memcpy(command_buffer, RxBuffer, Uart2_Rx_Cnt - 2U);
+          command_ready = Uart2_Rx_Cnt - 2U;
+          if (command_ready == 0U) uart_overflow_pending = 1U;
+        }
+        else uart_overflow_pending = 1U;
+        Uart2_Rx_Cnt = 0U;
+      }
+    }
   }
 
   HAL_UART_Receive_IT(&huart2, &aRxBuffer, 1);
@@ -696,11 +874,7 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
-#if IMU_ENABLE
   IMU_OnDataReady(GPIO_Pin);
-#else
-  (void)GPIO_Pin;
-#endif
 }
 
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
@@ -709,7 +883,7 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
   {
     uart_tx_busy = 0U;
     Uart2_Rx_Cnt = 0U;
-    memset(RxBuffer, 0, sizeof(RxBuffer));
+    rx_discard = 1U;
     HAL_UART_Receive_IT(&huart2, &aRxBuffer, 1);
   }
   else if (huart->Instance == USART6)
